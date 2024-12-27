@@ -1,0 +1,15 @@
+{
+    "files.associations": {
+        "raymath.h": "c",
+        "assert.h": "c",
+        "stdio.h": "c",
+        "string.h": "c",
+        "stdlib.h": "c",
+        "limits.h": "c",
+        "pwd.h": "c"
+    },
+    "lldb.displayFormat": "auto",
+    "lldb.dereferencePointers": true,
+    "lldb.consoleMode": "commands",
+    "lldb.showDisassembly": "auto"
+}
