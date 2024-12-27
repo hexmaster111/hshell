@@ -170,13 +170,24 @@ typedef struct CmdSlice
 
 typedef struct CmdList
 {
-    CmdSlice command[128];
-    int commandused;
+    CmdSlice command[10];
+    int commands_used;
 } CmdList;
 
+const char *GetHomeDir()
+{
+    const char *homedir;
+
+    if ((homedir = getenv("HOME")) == NULL)
+    {
+        homedir = getpwuid(getuid())->pw_dir;
+    }
+
+    return homedir;
+}
 
 /*
-   $ENVVAR ; | $(CMD TO RUN) ~
+   $ENVVAR ; | $(CMD TO RUN) ~ &
 
     > mkdir test; ./doSomething.sh; rmdir test;
     XPand{
@@ -204,11 +215,56 @@ typedef struct CmdList
         .command[0] = "echo /bin/;/usr/bin/;"
     }
 
- */
-char *ExpandInput(char *str)
-{
+    >cd /; find | grep "raylib.so"
+    XPand{
+        .command[0] = cd /
+        .command[1] = find
+        .command[1].isPipe = true;
+        .command[2] = grep "raylib.so"
+    }
 
-    return str;
+    >find | grep "raylib.so"
+    XPand{
+        .command[0]=find,
+        .command[0].ispipe = true;
+        .command[1]=grep "raylib.so"
+    }
+
+*/
+CmdList ExpandInput(char *str)
+{
+    CmdList r = {0};
+
+    char *c = str;
+
+    int cmdidx = -1; /* -1 so the first pass incs to 0 */
+
+NEXT:
+    cmdidx += 1;
+
+    r.command[cmdidx].start = c;
+
+    // TODO: somewhere in here is where we will modify str, and insert our $Expanded vars
+    while (*c != ';' && *c != '|' && *c)
+        c += 1;
+
+    r.command[cmdidx].len = c - r.command[cmdidx].start;
+
+    // if value at c != \0
+    if (*c)
+    {
+        if (*c == '|')
+            r.command[cmdidx].isPipeIntoNext = 1;
+
+        while (*c == ' ' || *c == ';' || *c == '|')
+            c += 1; // trim the start of the next string
+
+        goto NEXT;
+    }
+
+    r.commands_used = cmdidx + 1; // idx -> count
+
+    return r;
 }
 
 void SplitOnSpaces(
@@ -216,14 +272,14 @@ void SplitOnSpaces(
     int *argc,
     int buffers,
     int bufferlen,
-    char argv[buffers][bufferlen])
+    char argv[buffers][bufferlen],
+    int strlen)
 {
-    int slen = strlen(str);
     int arg_idx = 0, char_idx = 0;
 
     char *curbuf = argv[arg_idx];
 
-    for (int i = 0; i < slen; i++)
+    for (int i = 0; i < strlen; i++)
     {
         if (char_idx > bufferlen)
         {
@@ -297,19 +353,18 @@ void Exec(int argc, int bufflen, char argv[argc][bufflen])
     }
 }
 
-void ExecuteInput(char *exp)
+void ExecuteInput(char *exp, int len)
 {
     int argc = 0;
     char argv[10][255] = {0};
 
-    SplitOnSpaces(exp, &argc, 9, 255, argv);
+    SplitOnSpaces(exp, &argc, 9, 255, argv, len);
 
     I_BuiltInCommand *builtin = is_builtin(argv[0]);
 
     if (builtin)
     {
         builtin->method(argc, argv);
-        return;
     }
     else
     {
@@ -319,23 +374,81 @@ void ExecuteInput(char *exp)
         GetCursorPosition(&colBeforeExec, &rowBeforeExec);
         StoreTerminalConfig();
         SetSensableTerminal();
-        Exec(argc + 1, 255, argv);
+        Exec(argc, 255, argv);
         RestoreTermConfig();
         GetCursorPosition(&colAfterExec, &rowAfterExec);
         g_ui_nextfreeline = rowAfterExec;
     }
 }
 
-char *GetHomeDir()
+void DoPipedCommand(CmdSlice first, CmdSlice into)
 {
-    const char *homedir;
+    puts("TODO: Pipe Command");
+    return;
 
-    if ((homedir = getenv("HOME")) == NULL)
+    int first_argc, into_argc;
+    char first_argv[10][255] = {0}, into_argv[10][255] = {0};
+
+    SplitOnSpaces(first.start, &first_argc, 9, 255, first_argv, first.len);
+    SplitOnSpaces(into.start, &into_argc, 9, 255, into_argv, into.len);
+
+    int pipefd[2];
+    pid_t p1, p2;
+
+    if (0 > pipe(pipefd))
     {
-        homedir = getpwuid(getuid())->pw_dir;
+        perror("pipe");
+        return;
     }
 
-    return homedir;
+    if (0 > (p1 = fork()))
+    {
+        perror("fork");
+        return;
+    }
+
+    if (p1 == 0)
+    {
+        /* we are the fisrt command */
+
+        exit(0); // this fork will always exit when done
+    }
+
+    if (0 > (p2 = fork()))
+    {
+        perror("fork");
+        return;
+    }
+
+    if (p2 == 0)
+    {
+        /* we are the 2nd command running */
+        exit(0);
+    }
+
+    // THIS IS STILL A WORK IN PROGRESS
+
+}
+
+void ExecuteCommandList(CmdList cl)
+{
+    int cmd = 0;
+
+    while (cl.commands_used > cmd)
+    {
+
+        if (cl.command[cmd].isPipeIntoNext)
+        {
+            DoPipedCommand(cl.command[cmd], cl.command[cmd + 1]);
+
+            cmd += 2; // use both commands
+        }
+        else
+        {
+            ExecuteInput(cl.command[cmd].start, cl.command[cmd].len);
+            cmd += 1; // use a single command
+        }
+    }
 }
 
 void DrawConsoleLine()
@@ -374,7 +487,13 @@ int main(int argc, char *argv[])
             continue; /* No INput */
 
         LogToConsole(userinput);
-        char *expand = ExpandInput(userinput);
-        ExecuteInput(expand);
+
+        // todo:     GetCursorPosition(&colBeforeExec, &rowBeforeExec);
+        //  StoreTerminalConfig();
+        //  SetSensableTerminal();
+        //  this stuff should be done before executeCommandList, and resotred after
+
+        CmdList expand = ExpandInput(userinput);
+        ExecuteCommandList(expand);
     }
 }
