@@ -1,5 +1,7 @@
 #include "vt100.h"
 
+#include <signal.h>
+
 #include <string.h>
 #include <stdio.h>
 #include <string.h>
@@ -10,45 +12,65 @@
 #include <linux/limits.h>
 #include <pwd.h>
 
-int g_ui_nextfreeline = 1;
-
-char *GetNextRecycleBuffer()
-{
-#define GLOBAL_BUFFERS (12)
 #define GLOBAL_BUFFER_LEN (1024)
-
-    static char g_buffers[GLOBAL_BUFFERS][GLOBAL_BUFFER_LEN] = {0};
-    static int g_buff_idx = 0;
-
-    char *r = g_buffers[g_buff_idx];
-
-    memset(r, 0, GLOBAL_BUFFER_LEN);
-
-    g_buff_idx = (g_buff_idx + 1) % GLOBAL_BUFFERS;
-    return r;
-
-#undef GLOBAL_BUFFERS
-}
+int g_ui_nextfreeline = 1;
 
 static inline int IsInRange(int v, int min_inc, int max_inc) { return (v >= min_inc) && (v <= max_inc); }
 
-/*
-    Converts a /Full/Path/Into/ -> /F/P/Into/
-    Converts a /ReallyLongPath/WithLogFolderNames/Into/ -> /RLP/WLFN/Into/
-*/
-char *MakePathShortForUser(char *path)
-{
-    char *buff = GetNextRecycleBuffer();
 
-    return buff;
-}
 
 typedef char argv_t[10][255];
 typedef char argv_s1_t[9][255];
 
+
+void LogToConsole(char *str)
+{
+    int r, c;
+    GetScreenSize(&c, &r);
+
+    SetCurrsorPos(0, g_ui_nextfreeline);
+    DrawText(str);
+    DrawText("\r\n");
+
+    g_ui_nextfreeline += 1;
+
+    WriteGraphicsOut();
+}
+
+typedef struct CmdSlice
+{
+    char *start;
+    int len;
+
+    int isPipeIntoNext;
+
+} CmdSlice;
+
+typedef struct CmdList
+{
+    CmdSlice command[10];
+    int commands_used;
+} CmdList;
+
+
+char *GetNextRecycleBuffer();
+char *DoUserInputRead();
+void DrawConsoleLine();
+void ExecuteCommandList(CmdList cl);
+void ExecPipe2(CmdSlice first, CmdSlice into);
+void ExecuteInput(char *exp, int len);
+void ExecSingle(char **args);
+void printargs(char **ntargs);
+// RETURN IS NULL OR NULL TERMINATED LIST OF ARGS ( MUST BE FREE'D )
+char **SplitOnSpaces(char *str, int *argc, int buffers, int bufferlen, char argv[buffers][bufferlen], int strlen);
+CmdList ExpandInput(char *str);
+const char *GetHomeDir();
+char *MakePathShortForUser(char *path);
+
+
 void BuiltIn_ChangeDir(int argc, argv_s1_t argv)
 {
-    if (argc != 1)
+    if (argc != 2)
         return; // TODO: Error, not enough args
 
     if (chdir(argv[1]))
@@ -93,86 +115,60 @@ I_BuiltInCommand *is_builtin(const char *cmd)
     return NULL;
 }
 
-char *DoUserInputRead()
-{
-    char *buffer = GetNextRecycleBuffer();
-    int bi = 0;
 
-    ShowCurrsor();
+struct sigaction sigact;
+
+
+static void signal_handler(int sig){
+    if (sig == SIGINT) puts("Caught signal for Ctrl+C");
+}
+
+int main(int argc, char *argv[])
+{
+
+    sigact.sa_handler = signal_handler;
+
+
+    InitConsole();
+    ClearConsole();
+    HomeCurrsor();
     WriteGraphicsOut();
 
-    for (;;)
+    while (1)
     {
-        TERM_KEY tk = ReadKey();
-        char lillbuf[4] = {0};
 
-        if (tk == TK_ENTER && bi != 0)
-            goto DONE_READING;
+        int cols, rows;
+        GetScreenSize(&cols, &rows);
+        SetCurrsorPos(0, rows - 1);
+        ClearLine();
 
-        if (IsInRange(tk, ' ', '~'))
-        {
-            lillbuf[0] = tk;
-            lillbuf[1] = '\0';
+        DrawConsoleLine();
 
-            DrawText(lillbuf);
-            WriteGraphicsOut();
+        char *userinput = DoUserInputRead();
+        if (!userinput)
+            continue; /* No INput */
 
-            buffer[bi] = tk;
-            bi += 1;
-        }
+        LogToConsole(userinput);
 
-        if (tk == TK_BACKSPACE && bi > 0)
-        {
-            lillbuf[0] = '\b';
-            lillbuf[1] = ' ';
-            lillbuf[2] = '\b';
-            lillbuf[3] = '\0';
+        // todo:     GetCursorPosition(&colBeforeExec, &rowBeforeExec);
+        //  StoreTerminalConfig();
+        //  SetSensableTerminal();
+        //  this stuff should be done before executeCommandList, and resotred after
 
-            buffer[bi] = '\0';
-            bi -= 1;
-            buffer[bi] = '\0';
+        CmdList expand = ExpandInput(userinput);
 
-            if (0 > bi)
-                bi = 0;
+        int rowBeforeExec, colBeforeExec,
+            rowAfterExec, colAfterExec;
 
-            DrawText(lillbuf);
-            WriteGraphicsOut();
-        }
+        GetCursorPosition(&colBeforeExec, &rowBeforeExec);
+        StoreTerminalConfig();
+        SetSensableTerminal();
+        ExecuteCommandList(expand);
+        RestoreTermConfig();
+        GetCursorPosition(&colAfterExec, &rowAfterExec);
+        g_ui_nextfreeline = rowAfterExec;
     }
-
-DONE_READING:
-
-    return buffer;
 }
-
-void LogToConsole(char *str)
-{
-    int r, c;
-    GetScreenSize(&c, &r);
-
-    SetCurrsorPos(0, g_ui_nextfreeline);
-    DrawText(str);
-    DrawText("\r\n");
-
-    g_ui_nextfreeline += 1;
-
-    WriteGraphicsOut();
-}
-
-typedef struct CmdSlice
-{
-    char *start;
-    int len;
-
-    int isPipeIntoNext;
-
-} CmdSlice;
-
-typedef struct CmdList
-{
-    CmdSlice command[10];
-    int commands_used;
-} CmdList;
 
 const char *GetHomeDir()
 {
@@ -267,7 +263,8 @@ NEXT:
     return r;
 }
 
-void SplitOnSpaces(
+// RETURN IS NULL OR NULL TERMINATED LIST OF ARGS ( MUST BE FREE'D )
+char **SplitOnSpaces(
     char *str,
     int *argc,
     int buffers,
@@ -285,7 +282,7 @@ void SplitOnSpaces(
         {
             *argc = 0;
             // TODO: Arg is longer then max length
-            return;
+            return NULL;
         }
 
         if (str[i] == ' ')
@@ -300,7 +297,18 @@ void SplitOnSpaces(
         char_idx += 1;
     }
 
-    *argc = arg_idx;
+    *argc = arg_idx + 1;
+
+    char **args = calloc(*argc + 1, sizeof(char *));
+
+    args[*argc] = NULL;
+
+    for (int i = 0; i < *argc; i++)
+    {
+        args[i] = argv[i];
+    }
+
+    return args;
 }
 
 void printargs(char **ntargs)
@@ -316,7 +324,7 @@ void printargs(char **ntargs)
     }
 }
 
-void Exec(int argc, int bufflen, char argv[argc][bufflen])
+void ExecSingle(char **args)
 {
 
     pid_t pid = fork();
@@ -327,18 +335,8 @@ void Exec(int argc, int bufflen, char argv[argc][bufflen])
     }
     else if (pid == 0)
     {
-        char **args = calloc(sizeof(char *), argc + 1);
 
-        args[argc] = NULL;
-
-        for (int i = 0; i < argc; i++)
-        {
-            args[i] = argv[i];
-        }
-
-        int exec = execvp(argv[0], args);
-
-        free(args);
+        int exec = execvp(args[0], args);
 
         if (0 > exec)
         {
@@ -352,13 +350,13 @@ void Exec(int argc, int bufflen, char argv[argc][bufflen])
         wait(NULL); /* we are waiting for the kid to die */
     }
 }
-
 void ExecuteInput(char *exp, int len)
 {
     int argc = 0;
     char argv[10][255] = {0};
 
-    SplitOnSpaces(exp, &argc, 9, 255, argv, len);
+    /* points to values stack allc'd in this argv[] */
+    char **args = SplitOnSpaces(exp, &argc, 9, 255, argv, len);
 
     I_BuiltInCommand *builtin = is_builtin(argv[0]);
 
@@ -368,29 +366,20 @@ void ExecuteInput(char *exp, int len)
     }
     else
     {
-        int rowBeforeExec, colBeforeExec,
-            rowAfterExec, colAfterExec;
-
-        GetCursorPosition(&colBeforeExec, &rowBeforeExec);
-        StoreTerminalConfig();
-        SetSensableTerminal();
-        Exec(argc, 255, argv);
-        RestoreTermConfig();
-        GetCursorPosition(&colAfterExec, &rowAfterExec);
-        g_ui_nextfreeline = rowAfterExec;
+        ExecSingle(args);
     }
+
+    free(args);
 }
 
-void DoPipedCommand(CmdSlice first, CmdSlice into)
+void ExecPipe2(CmdSlice first, CmdSlice into)
 {
-    puts("TODO: Pipe Command");
-    return;
 
     int first_argc, into_argc;
     char first_argv[10][255] = {0}, into_argv[10][255] = {0};
 
-    SplitOnSpaces(first.start, &first_argc, 9, 255, first_argv, first.len);
-    SplitOnSpaces(into.start, &into_argc, 9, 255, into_argv, into.len);
+    char **fargs = SplitOnSpaces(first.start, &first_argc, 9, 255, first_argv, first.len);
+    char **iargs = SplitOnSpaces(into.start, &into_argc, 9, 255, into_argv, into.len);
 
     int pipefd[2];
     pid_t p1, p2;
@@ -410,6 +399,25 @@ void DoPipedCommand(CmdSlice first, CmdSlice into)
     if (p1 == 0)
     {
         /* we are the fisrt command */
+        if (0 > close(pipefd[0]))
+        {
+            perror("close");
+        }
+
+        if (0 > dup2(pipefd[1], STDOUT_FILENO))
+        {
+            perror("dup2");
+        }
+
+        if (0 > close(pipefd[1]))
+        {
+            perror("close");
+        }
+
+        if (0 > execvp(fargs[0], fargs))
+        {
+            perror("execvp");
+        }
 
         exit(0); // this fork will always exit when done
     }
@@ -423,11 +431,35 @@ void DoPipedCommand(CmdSlice first, CmdSlice into)
     if (p2 == 0)
     {
         /* we are the 2nd command running */
+
+        if (0 > close(pipefd[1]))
+        {
+            perror("close");
+        }
+
+        if (0 > dup2(pipefd[0], STDIN_FILENO))
+        {
+            perror("dup2");
+        }
+
+        if (0 > close(pipefd[0]))
+        {
+            perror("close");
+        }
+
+        if (0 > execvp(iargs[0], iargs))
+        {
+            perror("execvp");
+        }
+
         exit(0);
     }
 
-    // THIS IS STILL A WORK IN PROGRESS
+    /* We are the parent of all of thease */
+    wait(NULL);
+    wait(NULL);
 
+    free(iargs), free(fargs);
 }
 
 void ExecuteCommandList(CmdList cl)
@@ -439,7 +471,7 @@ void ExecuteCommandList(CmdList cl)
 
         if (cl.command[cmd].isPipeIntoNext)
         {
-            DoPipedCommand(cl.command[cmd], cl.command[cmd + 1]);
+            ExecPipe2(cl.command[cmd], cl.command[cmd + 1]);
 
             cmd += 2; // use both commands
         }
@@ -465,35 +497,82 @@ void DrawConsoleLine()
     DrawText(">");
 }
 
-int main(int argc, char *argv[])
+
+char *DoUserInputRead()
 {
-    InitConsole();
-    ClearConsole();
-    HomeCurrsor();
+    char *buffer = GetNextRecycleBuffer();
+    int bi = 0;
+
+    ShowCurrsor();
     WriteGraphicsOut();
 
-    while (1)
+    for (;;)
     {
+        TERM_KEY tk = ReadKey();
+        char lillbuf[4] = {0};
 
-        int cols, rows;
-        GetScreenSize(&cols, &rows);
-        SetCurrsorPos(0, rows - 1);
-        ClearLine();
+        if (tk == TK_ENTER && bi != 0)
+            goto DONE_READING;
 
-        DrawConsoleLine();
+        if (IsInRange(tk, ' ', '~'))
+        {
+            lillbuf[0] = tk;
+            lillbuf[1] = '\0';
 
-        char *userinput = DoUserInputRead();
-        if (!userinput)
-            continue; /* No INput */
+            DrawText(lillbuf);
+            WriteGraphicsOut();
 
-        LogToConsole(userinput);
+            buffer[bi] = tk;
+            bi += 1;
+        }
 
-        // todo:     GetCursorPosition(&colBeforeExec, &rowBeforeExec);
-        //  StoreTerminalConfig();
-        //  SetSensableTerminal();
-        //  this stuff should be done before executeCommandList, and resotred after
+        if (tk == TK_BACKSPACE && bi > 0)
+        {
+            lillbuf[0] = '\b';
+            lillbuf[1] = ' ';
+            lillbuf[2] = '\b';
+            lillbuf[3] = '\0';
 
-        CmdList expand = ExpandInput(userinput);
-        ExecuteCommandList(expand);
+            buffer[bi] = '\0';
+            bi -= 1;
+            buffer[bi] = '\0';
+
+            if (0 > bi)
+                bi = 0;
+
+            DrawText(lillbuf);
+            WriteGraphicsOut();
+        }
     }
+
+DONE_READING:
+
+    return buffer;
+}
+char *GetNextRecycleBuffer()
+{
+#define GLOBAL_BUFFERS (12)
+
+    static char g_buffers[GLOBAL_BUFFERS][GLOBAL_BUFFER_LEN] = {0};
+    static int g_buff_idx = 0;
+
+    char *r = g_buffers[g_buff_idx];
+
+    memset(r, 0, GLOBAL_BUFFER_LEN);
+
+    g_buff_idx = (g_buff_idx + 1) % GLOBAL_BUFFERS;
+    return r;
+
+#undef GLOBAL_BUFFERS
+}
+
+/*
+    Converts a /Full/Path/Into/ -> /F/P/Into/
+    Converts a /ReallyLongPath/WithLogFolderNames/Into/ -> /RLP/WLFN/Into/
+*/
+char *MakePathShortForUser(char *path)
+{
+    char *buff = GetNextRecycleBuffer();
+
+    return buff;
 }
